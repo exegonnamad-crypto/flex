@@ -305,9 +305,9 @@ app.post("/api/groups/bulk", auth, async (req, res) => {
     if (!groups?.length) return res.status(400).json({ error: "No groups provided" });
     const existing = (await TgGroup.find({ userId: req.user.id })).map(g => g.username);
     const newGroups = groups
-      .map((g: any) => ({ ...g, username: g.username.replace("@", "").replace("https://t.me/", "").trim() }))
-      .filter((g: any) => !existing.includes(g.username))
-      .map((g: any) => ({ userId: req.user.id, ...g }));
+      .map((g) => ({ ...g, username: g.username.replace("@", "").replace("https://t.me/", "").trim() }))
+      .filter((g) => !existing.includes(g.username))
+      .map((g) => ({ userId: req.user.id, ...g }));
     if (!newGroups.length) return res.json({ added: 0, message: "All groups already exist" });
     await TgGroup.insertMany(newGroups);
     res.json({ added: newGroups.length });
@@ -591,9 +591,9 @@ cron.schedule("* * * * *", async () => {
 app.get("/api/logs", auth, async (req, res) => {
   try {
     const { campaignId, limit = 100 } = req.query;
-    const filter: any = { userId: req.user.id };
+    const filter = { userId: req.user.id };
     if (campaignId) filter.campaignId = campaignId;
-    const logs = await CampaignLog.find(filter).sort({ sentAt: -1 }).limit(parseInt(limit as string));
+    const logs = await CampaignLog.find(filter).sort({ sentAt: -1 }).limit(parseInt(limit));
     res.json(logs);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
