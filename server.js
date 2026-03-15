@@ -505,6 +505,106 @@ asyncio.run(main())
 });
 
 // QR Generate
+// QR Login — single endpoint that generates QR AND waits for scan (stays connected)
+app.post("/api/accounts/qr-login", auth, async (req, res) => {
+  try {
+    await checkLimit(req.user.id, "accounts");
+    const { apiId, apiHash, proxy, label, warmupEnabled } = req.body;
+    const useApiId = apiId || DEFAULT_API_ID;
+    const useApiHash = apiHash || DEFAULT_API_HASH;
+    const proxyParts = proxy ? proxy.replace("socks5://","").split(":") : null;
+    const proxyLine = proxyParts ? `, proxy=("socks5", "${proxyParts[0]}", int("${proxyParts[1] || 1080}"))` : "";
+    const devices = ["Samsung Galaxy S23","iPhone 14 Pro","Xiaomi 13","OnePlus 11","Google Pixel 7"];
+    const device = devices[Math.floor(Math.random() * devices.length)];
+
+    // This script generates QR, waits up to 60s for scan, returns result
+    const script = `
+import asyncio, json, base64, sys
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
+try:
+    import qrcode, io
+    HAS_QR = True
+except ImportError:
+    HAS_QR = False
+
+async def main():
+    client = TelegramClient(StringSession(), int("${useApiId}"), "${useApiHash}"${proxyLine},
+        device_model="${device}", system_version="Android 13", app_version="9.6.7")
+    try:
+        await client.connect()
+        qr_login = await client.qr_login()
+
+        # Generate QR image
+        qr_image = ""
+        if HAS_QR:
+            try:
+                qr = qrcode.QRCode(border=2)
+                qr.add_data(qr_login.url)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                qr_image = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+            except: pass
+
+        # Output QR immediately so frontend can show it
+        sys.stdout.write(json.dumps({"type": "qr", "url": qr_login.url, "qrImage": qr_image}) + "\n")
+        sys.stdout.flush()
+
+        # Wait for scan — up to 60 seconds
+        try:
+            await asyncio.wait_for(qr_login.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            await client.disconnect()
+            print(json.dumps({"success": False, "error": "QR expired — not scanned in time"}))
+            return
+
+        # Scanned successfully
+        import random
+        await asyncio.sleep(random.uniform(1, 3))
+        await client.get_dialogs(limit=3)
+        me = await client.get_me()
+        session = client.session.save()
+        await client.disconnect()
+        print(json.dumps({
+            "success": True,
+            "session": session,
+            "username": me.username or "",
+            "firstName": me.first_name or "",
+            "phone": me.phone or ""
+        }))
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        print(json.dumps({"success": False, "error": str(e)}))
+
+asyncio.run(main())
+`;
+
+    // Set long timeout for QR scan wait
+    const result = await runPython(script, 75000);
+
+    if (!result.success) return res.status(400).json(result);
+
+    const acc = await TgAccount.create({
+      userId: req.user.id, phone: result.phone || "",
+      apiId: useApiId, apiHash: useApiHash,
+      sessionString: result.session,
+      label: label || result.firstName || result.username || "QR Account",
+      proxy: proxy || "",
+      deviceModel: `CampaignX-${Math.random().toString(36).slice(2, 7)}`,
+      status: warmupEnabled ? "warming" : "active",
+      warmupEnabled: warmupEnabled || false,
+      warmupDay: 0, warmupTarget: 14,
+      warmupStartedAt: warmupEnabled ? new Date() : undefined,
+    });
+    res.json({ success: true, account: { ...acc.toObject(), sessionString: undefined } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// QR Generate only (for getting QR image to display)
 app.post("/api/accounts/qr-generate", auth, async (req, res) => {
   try {
     await checkLimit(req.user.id, "accounts");
@@ -531,15 +631,18 @@ async def main():
         await client.connect()
         qr_login = await client.qr_login()
         session = client.session.save()
+        token = base64.b64encode(qr_login.token).decode() if hasattr(qr_login, "token") else ""
         qr_image = ""
         if HAS_QR:
-            qr = qrcode.QRCode(border=2)
-            qr.add_data(qr_login.url)
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            qr_image = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+            try:
+                qr = qrcode.QRCode(border=2)
+                qr.add_data(qr_login.url)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                qr_image = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+            except: pass
         await client.disconnect()
         print(json.dumps({"success": True, "url": qr_login.url, "session": session, "qrImage": qr_image}))
     except Exception as e:
@@ -550,7 +653,7 @@ asyncio.run(main())
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// QR Poll
+// QR Poll — check if session is now authenticated
 app.post("/api/accounts/qr-poll", auth, async (req, res) => {
   try {
     const { session, apiId, apiHash, label, proxy, warmupEnabled } = req.body;
@@ -558,17 +661,15 @@ app.post("/api/accounts/qr-poll", auth, async (req, res) => {
     const useApiId = apiId || DEFAULT_API_ID;
     const useApiHash = apiHash || DEFAULT_API_HASH;
     const script = `
-import asyncio, json, random
+import asyncio, json
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 async def main():
     try:
         client = TelegramClient(StringSession("${session}"), int("${useApiId}"), "${useApiHash}")
         await client.connect()
-        me = await client.get_me()
-        if me:
-            await asyncio.sleep(random.uniform(1, 3))
-            await client.get_dialogs(limit=5)
+        if await client.is_user_authorized():
+            me = await client.get_me()
             new_session = client.session.save()
             await client.disconnect()
             print(json.dumps({"success": True, "scanned": True, "session": new_session, "username": me.username or "", "firstName": me.first_name or "", "phone": me.phone or ""}))
