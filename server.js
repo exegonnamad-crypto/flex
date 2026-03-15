@@ -338,8 +338,11 @@ function genReferralCode(userId) {
 
 function runPython(script, timeoutMs = 120000) {
   return new Promise((resolve) => {
-    const py = spawn("python3", ["-c", script]);
+    let py;
+    try { py = spawn("python3", ["-c", script]); }
+    catch (e) { return resolve({ success: false, error: "python3 not found: " + e.message }); }
     let out = "", err = "";
+    py.on("error", (e) => resolve({ success: false, error: "python3 unavailable: " + e.message }));
     py.stdout.on("data", d => out += d.toString());
     py.stderr.on("data", d => err += d.toString());
     py.on("close", () => {
@@ -349,7 +352,7 @@ function runPython(script, timeoutMs = 120000) {
       }
       resolve({ success: false, error: err || out || "No response" });
     });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, timeoutMs);
+    setTimeout(() => { try { py.kill(); } catch {} resolve({ success: false, error: "Timeout" }); }, timeoutMs);
   });
 }
 
