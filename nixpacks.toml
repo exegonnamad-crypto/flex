@@ -4,7 +4,7 @@ nixPkgs = ["nodejs_20", "python311", "python311Packages.pip"]
 [phases.install]
 cmds = [
   "npm install",
-  "pip install telethon --break-system-packages"
+  "pip install telethon qrcode pillow --break-system-packages"
 ]
 
 [start]
