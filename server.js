@@ -12,7 +12,6 @@ require("dotenv").config();
 const app = express();
 app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }));
 
-// FIX: Raw body for NOWPayments webhook BEFORE express.json
 app.use((req, res, next) => {
   if (req.path === "/api/payments/webhook") {
     express.raw({ type: "*/*" })(req, res, next);
@@ -28,15 +27,14 @@ const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || "";
 const DEFAULT_API_ID = process.env.DEFAULT_API_ID || "2040";
 const DEFAULT_API_HASH = process.env.DEFAULT_API_HASH || "b18441a1ff607e10a989891a5462e627";
 const BACKEND_URL = process.env.BACKEND_URL || "https://flex-production-da21.up.railway.app";
+const GROQ_MODEL = "llama-3.1-8b-instant";
 
-// ── DATABASE ──────────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI, {
   serverSelectionTimeoutMS: 10000,
   socketTimeoutMS: 45000,
 }).then(() => console.log("✅ MongoDB connected"))
   .catch(e => console.error("❌ DB Error:", e.message));
 
-// ── SCHEMAS ───────────────────────────────────────────────────────────────────
 const User = mongoose.model("User", new mongoose.Schema({
   name: { type: String, required: true, trim: true },
   email: { type: String, unique: true, lowercase: true, trim: true },
@@ -212,7 +210,6 @@ const Blacklist = mongoose.model("Blacklist", new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 }));
 
-// FIX: Inbox schemas defined HERE — before any routes that use them
 const InboxMessage = mongoose.model("InboxMessage", new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
   accountId: { type: mongoose.Schema.Types.ObjectId, ref: "TgAccount", index: true },
@@ -252,7 +249,6 @@ const AccountInboxSettings = mongoose.model("AccountInboxSettings", new mongoose
   createdAt: { type: Date, default: Date.now },
 }));
 
-// ── PLAN CONFIG ───────────────────────────────────────────────────────────────
 const PLAN_LIMITS = {
   trial:   { accounts: 1,   groups: 50,    campaigns: 1,   postsPerDay: 10,   templates: 5,   teamMembers: 0  },
   starter: { accounts: 3,   groups: 500,   campaigns: 5,   postsPerDay: 100,  templates: 20,  teamMembers: 0  },
@@ -280,7 +276,6 @@ const PLAN_FEATURES = {
   agency:  { spintax: true,  mediaMessages: true,  warmupMode: true,  smartRotation: true,  autoBlacklist: true,  abTesting: true,  webhookNotifications: true,  whiteLabel: true,  teamMembers: true,  csvExport: true,  referral: true },
 };
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "No token" });
@@ -380,16 +375,22 @@ app.post("/api/register", async (req, res) => {
     const user = await User.create({ name: name.trim(), email: email.toLowerCase(), password: hash, isAdmin, plan: isAdmin ? "agency" : "trial", referredBy });
     await User.findByIdAndUpdate(user._id, { referralCode: genReferralCode(user._id) });
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, isAdmin: user.isAdmin, credits: user.credits } });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: isAdmin ? "agency" : "trial", isAdmin, credits: user.credits } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// FIX 1: Always force admin plan on login for admin email
 app.post("/api/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Invalid credentials" });
-    if (email.toLowerCase() === ADMIN_EMAIL && !user.isAdmin) await User.findByIdAndUpdate(user._id, { isAdmin: true, plan: "agency" });
+    // FIXED: always update admin — not just when isAdmin is false
+    if (email.toLowerCase() === ADMIN_EMAIL) {
+      await User.findByIdAndUpdate(user._id, { isAdmin: true, plan: "agency" });
+      user.isAdmin = true;
+      user.plan = "agency";
+    }
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "30d" });
     res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, isAdmin: user.isAdmin, credits: user.credits } });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -504,8 +505,6 @@ asyncio.run(main())
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// QR Generate
-// QR Login — single endpoint that generates QR AND waits for scan (stays connected)
 app.post("/api/accounts/qr-login", auth, async (req, res) => {
   try {
     await checkLimit(req.user.id, "accounts");
@@ -516,8 +515,6 @@ app.post("/api/accounts/qr-login", auth, async (req, res) => {
     const proxyLine = proxyParts ? `, proxy=("socks5", "${proxyParts[0]}", int("${proxyParts[1] || 1080}"))` : "";
     const devices = ["Samsung Galaxy S23","iPhone 14 Pro","Xiaomi 13","OnePlus 11","Google Pixel 7"];
     const device = devices[Math.floor(Math.random() * devices.length)];
-
-    // This script generates QR, waits up to 60s for scan, returns result
     const script = `
 import asyncio, json, base64, sys
 from telethon import TelegramClient
@@ -535,8 +532,6 @@ async def main():
     try:
         await client.connect()
         qr_login = await client.qr_login()
-
-        # Generate QR image
         qr_image = ""
         if HAS_QR:
             try:
@@ -548,33 +543,21 @@ async def main():
                 img.save(buf, format="PNG")
                 qr_image = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
             except: pass
-
-        # Output QR immediately so frontend can show it
         sys.stdout.write(json.dumps({"type": "qr", "url": qr_login.url, "qrImage": qr_image}) + "\n")
         sys.stdout.flush()
-
-        # Wait for scan — up to 60 seconds
         try:
             await asyncio.wait_for(qr_login.wait(), timeout=60)
         except asyncio.TimeoutError:
             await client.disconnect()
-            print(json.dumps({"success": False, "error": "QR expired — not scanned in time"}))
+            print(json.dumps({"success": False, "error": "QR expired"}))
             return
-
-        # Scanned successfully
         import random
         await asyncio.sleep(random.uniform(1, 3))
         await client.get_dialogs(limit=3)
         me = await client.get_me()
         session = client.session.save()
         await client.disconnect()
-        print(json.dumps({
-            "success": True,
-            "session": session,
-            "username": me.username or "",
-            "firstName": me.first_name or "",
-            "phone": me.phone or ""
-        }))
+        print(json.dumps({"success": True, "session": session, "username": me.username or "", "firstName": me.first_name or "", "phone": me.phone or ""}))
     except Exception as e:
         try: await client.disconnect()
         except: pass
@@ -582,12 +565,8 @@ async def main():
 
 asyncio.run(main())
 `;
-
-    // Set long timeout for QR scan wait
     const result = await runPython(script, 75000);
-
     if (!result.success) return res.status(400).json(result);
-
     const acc = await TgAccount.create({
       userId: req.user.id, phone: result.phone || "",
       apiId: useApiId, apiHash: useApiHash,
@@ -604,7 +583,6 @@ asyncio.run(main())
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// QR Generate only (for getting QR image to display)
 app.post("/api/accounts/qr-generate", auth, async (req, res) => {
   try {
     await checkLimit(req.user.id, "accounts");
@@ -631,7 +609,6 @@ async def main():
         await client.connect()
         qr_login = await client.qr_login()
         session = client.session.save()
-        token = base64.b64encode(qr_login.token).decode() if hasattr(qr_login, "token") else ""
         qr_image = ""
         if HAS_QR:
             try:
@@ -653,7 +630,6 @@ asyncio.run(main())
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// QR Poll — check if session is now authenticated
 app.post("/api/accounts/qr-poll", auth, async (req, res) => {
   try {
     const { session, apiId, apiHash, label, proxy, warmupEnabled } = req.body;
@@ -878,7 +854,6 @@ app.delete("/api/groups", auth, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Groups CSV export
 app.get("/api/groups/export", auth, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
@@ -940,7 +915,7 @@ app.delete("/api/templates/:id", auth, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── AI ────────────────────────────────────────────────────────────────────────
+// ── AI — FIX 2: updated model name ───────────────────────────────────────────
 app.post("/api/ai/rewrite", auth, async (req, res) => {
   try {
     const { message, count = 5, tone = "marketing", useSpintax = false } = req.body;
@@ -948,13 +923,16 @@ app.post("/api/ai/rewrite", auth, async (req, res) => {
     const tones = { marketing: "persuasive marketing", casual: "casual friendly", professional: "formal professional", urgent: "urgent FOMO-driven", funny: "humorous witty" };
     const spintaxNote = useSpintax ? " Use {option1|option2} spintax for words that can vary." : "";
     const r = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
-      model: "llama3-8b-8192",
+      model: GROQ_MODEL,
       messages: [{ role: "user", content: `Rewrite this Telegram message into ${count} versions with ${tones[tone]||"marketing"} tone.${spintaxNote} Same meaning. Return ONLY a JSON array of strings, no markdown.\n\nOriginal: ${message}` }],
       max_tokens: 2000, temperature: 0.9,
     }, { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } });
     const text = r.data.choices[0].message.content.trim().replace(/```json|```/g,"").trim();
     res.json({ variants: JSON.parse(text) });
-  } catch (e) { res.status(500).json({ error: "AI rewrite failed" }); }
+  } catch (e) {
+    console.error("AI rewrite error:", e.response?.data || e.message);
+    res.status(500).json({ error: "AI rewrite failed" });
+  }
 });
 
 // ── CAMPAIGNS ─────────────────────────────────────────────────────────────────
@@ -1134,7 +1112,6 @@ cron.schedule("* * * * *", async () => {
     await TgAccount.updateMany({ status: "cooldown", cooldownUntil: { $lte: now } }, { status: "active", cooldownUntil: null });
     await User.updateMany({ planExpiresAt: { $lte: now }, plan: { $nin: ["trial","agency"] } }, { plan: "trial" });
 
-    // Warmup progression
     const warmingAccounts = await TgAccount.find({ status: "warming", warmupEnabled: true });
     for (const acc of warmingAccounts) {
       if (!acc.warmupStartedAt) continue;
@@ -1249,8 +1226,7 @@ app.delete("/api/autoreplies/:id", auth, async (req, res) => {
   try { await AutoReply.findOneAndDelete({ _id: req.params.id, userId: req.user.id }); res.json({ success: true }); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── INBOX — FIX: static routes BEFORE dynamic /:id routes ─────────────────────
-// Stats first (no :id conflict)
+// ── INBOX ─────────────────────────────────────────────────────────────────────
 app.get("/api/inbox/stats", auth, async (req, res) => {
   try {
     const [total, unread, replied, positive, negative, neutral, questions] = await Promise.all([
@@ -1266,13 +1242,11 @@ app.get("/api/inbox/stats", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Read-all before /:id routes
 app.put("/api/inbox/read-all", auth, async (req, res) => {
   try { await InboxMessage.updateMany({ userId: req.user.id }, { isRead: true }); res.json({ success: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Settings routes before /:id routes
 app.get("/api/inbox/settings/:accountId", auth, async (req, res) => {
   try {
     let s = await AccountInboxSettings.findOne({ accountId: req.params.accountId, userId: req.user.id });
@@ -1292,7 +1266,6 @@ app.put("/api/inbox/settings/:accountId", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Main inbox list
 app.get("/api/inbox", auth, async (req, res) => {
   try {
     const { accountId, isRead, sentiment, limit=50, page=1 } = req.query;
@@ -1310,7 +1283,6 @@ app.get("/api/inbox", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Dynamic :id routes last
 app.put("/api/inbox/:id/read", auth, async (req, res) => {
   try { await InboxMessage.findOneAndUpdate({ _id: req.params.id, userId: req.user.id }, { isRead: true }); res.json({ success: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -1330,7 +1302,6 @@ app.post("/api/inbox/:id/reply", auth, async (req, res) => {
     const account = await TgAccount.findOne({ _id: msg.accountId, userId: req.user.id });
     if (!account?.sessionString) return res.status(400).json({ error: "Account not available" });
     const escaped = replyText.replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\n/g,"\\n");
-    const target = msg.fromUserId || msg.fromUsername;
     const script = `
 import asyncio, json
 from telethon import TelegramClient
@@ -1361,7 +1332,7 @@ app.post("/api/inbox/:id/ai-reply", auth, async (req, res) => {
     if (!msg) return res.status(404).json({ error: "Not found" });
     const settings = await AccountInboxSettings.findOne({ accountId: msg.accountId }) || {};
     const r = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
-      model: "llama3-8b-8192",
+      model: GROQ_MODEL,
       messages: [
         { role: "system", content: (settings.aiSystemPrompt || "You are a helpful sales assistant.") + " Reply in 1-3 sentences max. Be conversational." },
         { role: "user", content: msg.message },
@@ -1370,7 +1341,6 @@ app.post("/api/inbox/:id/ai-reply", auth, async (req, res) => {
     }, { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } });
     const aiReply = r.data.choices[0].message.content.trim();
     await InboxMessage.findByIdAndUpdate(msg._id, { aiReply, isRead: true });
-
     if (send) {
       const account = await TgAccount.findOne({ _id: msg.accountId, userId: req.user.id });
       if (account?.sessionString) {
@@ -1438,7 +1408,6 @@ async function pollInboxForAccount(account) {
   try {
     const settings = await AccountInboxSettings.findOne({ accountId: account._id });
     if (!settings || settings.replyMode === "off") return;
-
     const script = `
 import asyncio, json
 from telethon import TelegramClient
@@ -1491,7 +1460,7 @@ asyncio.run(main())
       if (GROQ_API_KEY) {
         try {
           const sr = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
-            model: "llama3-8b-8192",
+            model: GROQ_MODEL,
             messages: [{ role: "user", content: `Classify as exactly one word: positive, negative, neutral, or question.\nMessage: "${m.message.slice(0,150).replace(/"/g,"'")}"` }],
             max_tokens: 5, temperature: 0,
           }, { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } });
@@ -1507,7 +1476,7 @@ asyncio.run(main())
           const replyCount = await InboxMessage.countDocuments({ accountId: account._id, fromUserId: m.fromUserId, isReplied: true });
           if (replyCount >= (settings.maxAutoRepliesPerUser||5)) continue;
           const r = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
-            model: "llama3-8b-8192",
+            model: GROQ_MODEL,
             messages: [
               { role: "system", content: (settings.aiSystemPrompt||"You are a helpful assistant.") + " Reply in 1-2 sentences." },
               { role: "user", content: m.message },
